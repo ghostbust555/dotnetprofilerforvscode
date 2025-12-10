@@ -1,0 +1,45 @@
+{
+  "name": "dotnet-profiler",
+  "displayName": "DotNet Profiler",
+  "description": "Monitor .NET process performance metrics using dotnet-counters",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Debuggers",
+    "Other"
+  ],
+  "activationEvents": [
+    "onDebug"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "dotnet-profiler.startMonitoring",
+        "title": "Start Monitoring .NET Process",
+        "category": "DotNet Profiler"
+      },
+      {
+        "command": "dotnet-profiler.stopMonitoring",
+        "title": "Stop Monitoring .NET Process",
+        "category": "DotNet Profiler"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^6.13.0",
+    "@typescript-eslint/parser": "^6.13.0",
+    "eslint": "^8.54.0",
+    "typescript": "^5.3.0"
+  }
+}

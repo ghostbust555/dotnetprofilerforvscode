@@ -1,0 +1,1414 @@
+import * as vscode from 'vscode';
+import { ChildProcess, spawn } from 'child_process';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
+
+let monitoringProcess: ChildProcess | null = null;
+let readInterval: ReturnType<typeof setInterval> | null = null;
+let outputFile: string | null = null;
+let lastFileSize = 0;
+let lastEventCount = 0;
+let panel: vscode.WebviewPanel | null = null;
+let extensionContext: vscode.ExtensionContext;
+let currentProcessId: number | null = null;
+
+interface DotNetProcess {
+    pid: number;
+    name: string;
+    commandLine: string;
+}
+
+export function activate(context: vscode.ExtensionContext) {
+    console.log('DotNet Profiler extension is now active');
+    extensionContext = context;
+
+    const startCommand = vscode.commands.registerCommand('dotnet-profiler.startMonitoring', async () => {
+        await startMonitoring();
+    });
+
+    const stopCommand = vscode.commands.registerCommand('dotnet-profiler.stopMonitoring', () => {
+        stopMonitoring();
+    });
+
+    context.subscriptions.push(
+        vscode.debug.onDidStartDebugSession((session) => {
+            if (isDotNetSession(session)) {
+                vscode.window.showInformationMessage(
+                    'DotNet debug session started. Use "DotNet Profiler: Start Monitoring" to monitor performance.',
+                    'Start Monitoring'
+                ).then(selection => {
+                    if (selection === 'Start Monitoring') {
+                        startMonitoring();
+                    }
+                });
+            }
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.debug.onDidTerminateDebugSession((session) => {
+            if (isDotNetSession(session)) {
+                stopMonitoring();
+            }
+        })
+    );
+
+    context.subscriptions.push(startCommand, stopCommand);
+}
+
+function isDotNetSession(session: vscode.DebugSession): boolean {
+    return session.type === 'coreclr' || session.type === 'clr' || session.type === 'dotnet';
+}
+
+async function isToolInstalled(toolName: string): Promise<boolean> {
+    return new Promise((resolve) => {
+        const proc = spawn(toolName, ['--version'], { shell: true });
+        proc.on('close', (code) => resolve(code === 0));
+        proc.on('error', () => resolve(false));
+    });
+}
+
+async function installTool(toolName: string): Promise<boolean> {
+    return new Promise((resolve) => {
+        vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: `Installing ${toolName}...`,
+            cancellable: false
+        }, async () => {
+            const proc = spawn('dotnet', ['tool', 'install', '--global', toolName], { shell: true });
+
+            let stderr = '';
+            proc.stderr?.on('data', (data) => {
+                stderr += data.toString();
+            });
+
+            return new Promise<void>((resolveProgress) => {
+                proc.on('close', (code) => {
+                    resolveProgress();
+                    if (code === 0) {
+                        vscode.window.showInformationMessage(`${toolName} installed successfully!`);
+                        resolve(true);
+                    } else {
+                        if (stderr.includes('already installed')) {
+                            resolve(true);
+                        } else {
+                            vscode.window.showErrorMessage(`Failed to install ${toolName}: ${stderr}`);
+                            resolve(false);
+                        }
+                    }
+                });
+                proc.on('error', (err) => {
+                    resolveProgress();
+                    vscode.window.showErrorMessage(`Failed to install ${toolName}: ${err.message}`);
+                    resolve(false);
+                });
+            });
+        });
+    });
+}
+
+async function ensureTool(toolName: string): Promise<boolean> {
+    if (await isToolInstalled(toolName)) {
+        return true;
+    }
+
+    const choice = await vscode.window.showWarningMessage(
+        `${toolName} is not installed. Would you like to install it now?`,
+        'Install',
+        'Cancel'
+    );
+
+    if (choice === 'Install') {
+        return await installTool(toolName);
+    }
+
+    return false;
+}
+
+async function listDotNetProcesses(): Promise<DotNetProcess[]> {
+    return new Promise((resolve) => {
+        const proc = spawn('dotnet-counters', ['ps'], { shell: true });
+        let output = '';
+
+        proc.stdout.on('data', (data) => {
+            output += data.toString();
+        });
+
+        proc.on('close', () => {
+            const processes: DotNetProcess[] = [];
+            const lines = output.split('\n');
+
+            for (const line of lines) {
+                if (!line.trim()) continue;
+
+                const match = line.match(/^\s*(\d+)\s+(\S+)\s+(.*)/);
+                if (match) {
+                    processes.push({
+                        pid: parseInt(match[1], 10),
+                        name: match[2],
+                        commandLine: match[3].trim()
+                    });
+                }
+            }
+
+            resolve(processes);
+        });
+
+        proc.on('error', () => resolve([]));
+    });
+}
+
+async function findProcessByWorkspacePath(): Promise<number | null> {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders || workspaceFolders.length === 0) {
+        return null;
+    }
+
+    const workspacePath = workspaceFolders[0].uri.fsPath;
+    const processes = await listDotNetProcesses();
+
+    const userProcesses = processes.filter(p =>
+        !p.commandLine.includes('.vscode/extensions') &&
+        !p.commandLine.includes('.vscode\\extensions') &&
+        !p.commandLine.includes('MSBuild.dll') &&
+        !p.commandLine.includes('vstest.console.dll') &&
+        !p.name.includes('dotnet-counters') &&
+        !p.name.includes('dotnet-trace') &&
+        !p.name.includes('dotnet-gcdump')
+    );
+
+    const matchingProcesses = userProcesses.filter(p =>
+        p.commandLine.includes(workspacePath)
+    );
+
+    if (matchingProcesses.length === 1) {
+        return matchingProcesses[0].pid;
+    } else if (matchingProcesses.length > 1) {
+        return selectFromProcessList(matchingProcesses);
+    }
+
+    return null;
+}
+
+async function selectFromProcessList(processes: DotNetProcess[]): Promise<number | null> {
+    if (processes.length === 0) {
+        vscode.window.showErrorMessage('No .NET processes found.');
+        return null;
+    }
+
+    const items = processes.map(p => ({
+        label: `${p.pid}: ${p.name}`,
+        description: p.commandLine.length > 80
+            ? p.commandLine.substring(0, 80) + '...'
+            : p.commandLine,
+        detail: p.commandLine,
+        pid: p.pid
+    }));
+
+    const selected = await vscode.window.showQuickPick(items, {
+        placeHolder: 'Select a .NET process to monitor',
+        matchOnDescription: true,
+        matchOnDetail: true
+    });
+
+    return selected ? selected.pid : null;
+}
+
+async function getDebuggedProcessId(): Promise<number | null> {
+    const session = vscode.debug.activeDebugSession;
+
+    if (session && isDotNetSession(session)) {
+        const config = session.configuration;
+        if (config.processId && typeof config.processId === 'number') {
+            return config.processId;
+        }
+    }
+
+    const pidByWorkspace = await findProcessByWorkspacePath();
+    if (pidByWorkspace) {
+        return pidByWorkspace;
+    }
+
+    const allProcesses = await listDotNetProcesses();
+    const userProcesses = allProcesses.filter(p =>
+        !p.commandLine.includes('.vscode/extensions') &&
+        !p.commandLine.includes('.vscode\\extensions') &&
+        !p.commandLine.includes('MSBuild.dll') &&
+        !p.commandLine.includes('vstest.console.dll') &&
+        !p.name.includes('dotnet-counters') &&
+        !p.name.includes('dotnet-trace') &&
+        !p.name.includes('dotnet-gcdump')
+    );
+
+    if (userProcesses.length === 0) {
+        vscode.window.showErrorMessage('No .NET processes found. Make sure your application is running.');
+        return null;
+    }
+
+    return selectFromProcessList(userProcesses);
+}
+
+function createWebviewPanel(processId: number): vscode.WebviewPanel {
+    const newPanel = vscode.window.createWebviewPanel(
+        'dotnetProfiler',
+        `DotNet Profiler - PID ${processId}`,
+        vscode.ViewColumn.Beside,
+        {
+            enableScripts: true,
+            retainContextWhenHidden: true
+        }
+    );
+
+    newPanel.webview.html = getWebviewContent();
+
+    newPanel.webview.onDidReceiveMessage(
+        async (message) => {
+            switch (message.command) {
+                case 'takeMemorySnapshot':
+                    await takeMemorySnapshot();
+                    break;
+                case 'takeCpuTrace':
+                    await takeCpuTrace(message.duration || 5);
+                    break;
+                case 'dumpMemoryToFile':
+                    await dumpMemoryToFile();
+                    break;
+            }
+        },
+        undefined,
+        extensionContext.subscriptions
+    );
+
+    newPanel.onDidDispose(() => {
+        panel = null;
+        stopMonitoring();
+    }, null, extensionContext.subscriptions);
+
+    return newPanel;
+}
+
+async function takeMemorySnapshot(): Promise<void> {
+    if (!currentProcessId) {
+        vscode.window.showErrorMessage('No process being monitored');
+        return;
+    }
+
+    if (!await ensureTool('dotnet-gcdump')) {
+        return;
+    }
+
+    panel?.webview.postMessage({ type: 'snapshotStarted', tab: 'memory' });
+
+    const proc = spawn('dotnet-gcdump', ['report', '-p', currentProcessId.toString()], { shell: true });
+    let output = '';
+
+    proc.stdout.on('data', (data) => {
+        output += data.toString();
+    });
+
+    proc.stderr?.on('data', (data) => {
+        console.error('gcdump stderr:', data.toString());
+    });
+
+    proc.on('close', (code) => {
+        if (code === 0) {
+            const results = parseGcDumpOutput(output);
+            panel?.webview.postMessage({
+                type: 'memorySnapshot',
+                data: results
+            });
+        } else {
+            panel?.webview.postMessage({
+                type: 'snapshotError',
+                tab: 'memory',
+                error: 'Failed to capture memory snapshot'
+            });
+        }
+    });
+
+    proc.on('error', (err) => {
+        panel?.webview.postMessage({
+            type: 'snapshotError',
+            tab: 'memory',
+            error: err.message
+        });
+    });
+}
+
+async function dumpMemoryToFile(): Promise<void> {
+    if (!currentProcessId) {
+        vscode.window.showErrorMessage('No process being monitored');
+        return;
+    }
+
+    if (!await ensureTool('dotnet-gcdump')) {
+        return;
+    }
+
+    const defaultName = `gcdump-${currentProcessId}-${Date.now()}.gcdump`;
+    const uri = await vscode.window.showSaveDialog({
+        defaultUri: vscode.Uri.file(path.join(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || os.homedir(), defaultName)),
+        filters: { 'GC Dump Files': ['gcdump'], 'All Files': ['*'] },
+        title: 'Save Memory Dump'
+    });
+
+    if (!uri) {
+        return;
+    }
+
+    panel?.webview.postMessage({ type: 'dumpStarted' });
+
+    const proc = spawn('dotnet-gcdump', ['collect', '-p', currentProcessId.toString(), '-o', uri.fsPath], { shell: true });
+
+    proc.on('close', (code) => {
+        if (code === 0) {
+            panel?.webview.postMessage({ type: 'dumpComplete', path: uri.fsPath });
+            vscode.window.showInformationMessage(`Memory dump saved to ${uri.fsPath}`, 'Open Folder').then(selection => {
+                if (selection === 'Open Folder') {
+                    vscode.commands.executeCommand('revealFileInOS', uri);
+                }
+            });
+        } else {
+            panel?.webview.postMessage({ type: 'dumpError', error: 'Failed to create memory dump' });
+            vscode.window.showErrorMessage('Failed to create memory dump');
+        }
+    });
+
+    proc.on('error', (err) => {
+        panel?.webview.postMessage({ type: 'dumpError', error: err.message });
+        vscode.window.showErrorMessage(`Failed to create memory dump: ${err.message}`);
+    });
+}
+
+function parseGcDumpOutput(output: string): Array<{ type: string; count: number; bytes: number }> {
+    const results: Array<{ type: string; count: number; bytes: number }> = [];
+    const lines = output.split('\n');
+
+    // Skip header lines until we find the data
+    let dataStarted = false;
+    for (const line of lines) {
+        if (line.includes('Object Bytes') && line.includes('Count') && line.includes('Type')) {
+            dataStarted = true;
+            continue;
+        }
+
+        if (!dataStarted) continue;
+        if (!line.trim()) continue;
+
+        // Parse lines like: "      1,396,088         3  Entry<...>[]"
+        const match = line.match(/^\s*([\d,]+)\s+([\d,]+)\s+(.+)$/);
+        if (match) {
+            const bytes = parseInt(match[1].replace(/,/g, ''), 10);
+            const count = parseInt(match[2].replace(/,/g, ''), 10);
+            let type = match[3].trim();
+
+            // Clean up type name - remove assembly info in brackets
+            const bracketIdx = type.lastIndexOf('[');
+            if (bracketIdx > 0 && type.endsWith(']')) {
+                type = type.substring(0, bracketIdx).trim();
+            }
+
+            results.push({ type, count, bytes });
+        }
+    }
+
+    return results;
+}
+
+async function takeCpuTrace(durationSeconds: number): Promise<void> {
+    if (!currentProcessId) {
+        vscode.window.showErrorMessage('No process being monitored');
+        return;
+    }
+
+    if (!await ensureTool('dotnet-trace')) {
+        return;
+    }
+
+    panel?.webview.postMessage({ type: 'snapshotStarted', tab: 'cpu' });
+
+    const traceFile = path.join(os.tmpdir(), `dotnet-trace-${currentProcessId}-${Date.now()}.nettrace`);
+
+    // Collect trace for specified duration
+    const collectProc = spawn('dotnet-trace', [
+        'collect',
+        '-p', currentProcessId.toString(),
+        '--duration', `00:00:${durationSeconds.toString().padStart(2, '0')}`,
+        '-o', traceFile,
+        '--profile', 'cpu-sampling'
+    ], { shell: true });
+
+    collectProc.on('close', async (code) => {
+        if (code === 0 && fs.existsSync(traceFile)) {
+            // Generate report from trace file
+            const reportProc = spawn('dotnet-trace', ['report', traceFile, 'topN', '-n', '50', '--inclusive'], { shell: true });
+            let reportOutput = '';
+
+            reportProc.stdout.on('data', (data) => {
+                reportOutput += data.toString();
+            });
+
+            reportProc.on('close', (reportCode) => {
+                // Clean up trace file
+                try { fs.unlinkSync(traceFile); } catch { /* ignore */ }
+
+                if (reportCode === 0) {
+                    const results = parseCpuTraceOutput(reportOutput);
+                    panel?.webview.postMessage({
+                        type: 'cpuTrace',
+                        data: results
+                    });
+                } else {
+                    panel?.webview.postMessage({
+                        type: 'snapshotError',
+                        tab: 'cpu',
+                        error: 'Failed to generate CPU report'
+                    });
+                }
+            });
+        } else {
+            panel?.webview.postMessage({
+                type: 'snapshotError',
+                tab: 'cpu',
+                error: 'Failed to collect CPU trace'
+            });
+        }
+    });
+
+    collectProc.on('error', (err) => {
+        panel?.webview.postMessage({
+            type: 'snapshotError',
+            tab: 'cpu',
+            error: err.message
+        });
+    });
+}
+
+function parseCpuTraceOutput(output: string): Array<{ function: string; inclusivePercent: number; exclusivePercent: number }> {
+    const results: Array<{ function: string; inclusivePercent: number; exclusivePercent: number }> = [];
+    const lines = output.split('\n');
+
+    for (const line of lines) {
+        // Parse lines like: "1.  PortableThreadPool+WorkerThread.WorkerThreadStart()       33.33%              0%"
+        // Format: number. function_name    inclusive%    exclusive%
+        const match = line.match(/^\d+\.\s+(.+?)\s{2,}([\d.]+)%\s+([\d.]+)%/);
+        if (match) {
+            const funcName = match[1].trim();
+            // Skip non-useful entries
+            if (funcName === '(Non-Activities)' || funcName === 'Threads') {
+                continue;
+            }
+            results.push({
+                function: funcName,
+                inclusivePercent: parseFloat(match[2]),
+                exclusivePercent: parseFloat(match[3])
+            });
+        }
+    }
+
+    return results;
+}
+
+function getWebviewContent(): string {
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DotNet Profiler</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body {
+            height: 100%;
+            font-family: var(--vscode-font-family, sans-serif);
+            background: var(--vscode-editor-background, #1e1e1e);
+            color: var(--vscode-editor-foreground, #d4d4d4);
+        }
+        body {
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+        }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+        h1 { font-size: 1.3em; }
+        .zoom-controls {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .btn {
+            background: var(--vscode-button-secondaryBackground, #3c3c3c);
+            color: var(--vscode-button-secondaryForeground, #d4d4d4);
+            border: 1px solid var(--vscode-panel-border, #3c3c3c);
+            border-radius: 4px;
+            padding: 4px 12px;
+            cursor: pointer;
+            font-size: 13px;
+        }
+        .btn:hover { background: var(--vscode-button-secondaryHoverBackground, #505050); }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-primary {
+            background: var(--vscode-button-background, #0e639c);
+            color: var(--vscode-button-foreground, #ffffff);
+        }
+        .btn-primary:hover { background: var(--vscode-button-hoverBackground, #1177bb); }
+        .zoom-label { font-size: 0.85em; color: #888; min-width: 60px; text-align: center; }
+        .stats {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 16px;
+            flex-wrap: wrap;
+        }
+        .stat-card {
+            background: var(--vscode-input-background, #3c3c3c);
+            border: 1px solid var(--vscode-panel-border, #3c3c3c);
+            border-radius: 4px;
+            padding: 12px 20px;
+            text-align: center;
+            min-width: 120px;
+        }
+        .stat-value { font-size: 1.6em; font-weight: bold; }
+        .stat-value.cpu { color: #4fc3f7; }
+        .stat-value.memory { color: #81c784; }
+        .stat-value.gc { color: #ffb74d; }
+        .stat-label { font-size: 0.8em; color: #888; margin-top: 4px; }
+        .chart-container {
+            background: var(--vscode-input-background, #252526);
+            border: 1px solid var(--vscode-panel-border, #3c3c3c);
+            border-radius: 4px;
+            padding: 12px;
+            margin-bottom: 16px;
+        }
+        .chart-title { font-size: 0.95em; margin-bottom: 8px; }
+        .chart { height: 150px; position: relative; }
+        canvas { display: block; }
+
+        /* Tabs */
+        .tabs-container {
+            margin-top: 20px;
+            border: 1px solid var(--vscode-panel-border, #3c3c3c);
+            border-radius: 4px;
+            overflow: hidden;
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+        }
+        .tabs-header {
+            display: flex;
+            background: var(--vscode-editor-background, #1e1e1e);
+            border-bottom: 1px solid var(--vscode-panel-border, #3c3c3c);
+        }
+        .tab-btn {
+            flex: 1;
+            padding: 10px 16px;
+            background: transparent;
+            border: none;
+            color: var(--vscode-foreground, #d4d4d4);
+            cursor: pointer;
+            font-size: 13px;
+            border-bottom: 2px solid transparent;
+        }
+        .tab-btn:hover { background: var(--vscode-list-hoverBackground, #2a2d2e); }
+        .tab-btn.active {
+            border-bottom-color: var(--vscode-focusBorder, #007fd4);
+            background: var(--vscode-input-background, #3c3c3c);
+        }
+        .tab-content {
+            display: none;
+            padding: 16px;
+            background: var(--vscode-input-background, #252526);
+            flex: 1;
+            min-height: 0;
+            overflow: hidden;
+            flex-direction: column;
+        }
+        .tab-content.active { display: flex; }
+
+        /* Snapshot controls */
+        .snapshot-controls {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+        .snapshot-controls select, .snapshot-controls input[type="text"] {
+            padding: 4px 8px;
+            background: var(--vscode-input-background, #3c3c3c);
+            color: var(--vscode-input-foreground, #d4d4d4);
+            border: 1px solid var(--vscode-panel-border, #3c3c3c);
+            border-radius: 4px;
+        }
+        .snapshot-controls input[type="text"] {
+            flex: 1;
+            max-width: 300px;
+        }
+        .snapshot-controls input[type="text"]::placeholder {
+            color: var(--vscode-input-placeholderForeground, #888);
+        }
+
+        /* Data grid */
+        .data-grid {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+            table-layout: fixed;
+        }
+        .data-grid th, .data-grid td {
+            padding: 8px 12px;
+            text-align: left;
+            border-bottom: 1px solid var(--vscode-panel-border, #3c3c3c);
+        }
+        .data-grid th {
+            background: var(--vscode-editor-background, #1e1e1e);
+            font-weight: 600;
+            position: sticky;
+            top: 0;
+            cursor: pointer;
+        }
+        .data-grid th:hover { background: var(--vscode-list-hoverBackground, #2a2d2e); }
+        .data-grid tr:hover { background: var(--vscode-list-hoverBackground, #2a2d2e); }
+        .data-grid .num { text-align: right; font-family: monospace; white-space: nowrap; width: 100px; }
+        .data-grid .type-col { word-break: break-all; }
+        .data-grid .func-col { word-break: break-all; }
+        .grid-container {
+            flex: 1;
+            overflow-y: auto;
+            min-height: 0;
+        }
+        .loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 40px;
+            color: #888;
+        }
+        .loading::after {
+            content: '';
+            width: 20px;
+            height: 20px;
+            border: 2px solid #888;
+            border-top-color: transparent;
+            border-radius: 50%;
+            margin-left: 10px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #888;
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        #memoryGridContainer, #cpuGridContainer {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>DotNet Process Monitor</h1>
+        <div class="zoom-controls">
+            <button class="btn" id="zoomIn" title="Zoom In (30s)">+</button>
+            <span class="zoom-label" id="zoomLabel">1 min</span>
+            <button class="btn" id="zoomOut" title="Zoom Out (5min)">-</button>
+        </div>
+    </div>
+
+    <div class="stats">
+        <div class="stat-card">
+            <div class="stat-value cpu" id="cpuValue">0%</div>
+            <div class="stat-label">CPU Usage</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value memory" id="memoryValue">0 MB</div>
+            <div class="stat-label">Working Set</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value gc" id="gcHeapValue">0 MB</div>
+            <div class="stat-label">GC Heap</div>
+        </div>
+    </div>
+
+    <div class="chart-container">
+        <div class="chart-title">CPU Usage (%)</div>
+        <div class="chart"><canvas id="cpuChart"></canvas></div>
+    </div>
+
+    <div class="chart-container">
+        <div class="chart-title">Memory (MB)</div>
+        <div class="chart"><canvas id="memoryChart"></canvas></div>
+    </div>
+
+    <div class="tabs-container">
+        <div class="tabs-header">
+            <button class="tab-btn active" data-tab="memory">Memory</button>
+            <button class="tab-btn" data-tab="cpu">CPU</button>
+        </div>
+
+        <div class="tab-content active" id="tab-memory">
+            <div class="snapshot-controls">
+                <button class="btn btn-primary" id="takeMemorySnapshot">Take Memory Snapshot</button>
+                <button class="btn" id="dumpMemoryToFile">Dump Memory To File</button>
+                <input type="text" id="memoryFilter" placeholder="Filter types..." />
+            </div>
+            <div id="memoryGridContainer">
+                <div class="empty-state">Click "Take Memory Snapshot" to analyze heap allocations</div>
+            </div>
+        </div>
+
+        <div class="tab-content" id="tab-cpu">
+            <div class="snapshot-controls">
+                <button class="btn btn-primary" id="takeCpuTrace">Take CPU Trace</button>
+                <label>Duration:
+                    <select id="traceDuration">
+                        <option value="3">3 sec</option>
+                        <option value="5" selected>5 sec</option>
+                        <option value="10">10 sec</option>
+                        <option value="30">30 sec</option>
+                    </select>
+                </label>
+                <input type="text" id="cpuFilter" placeholder="Filter functions..." />
+            </div>
+            <div id="cpuGridContainer">
+                <div class="empty-state">Click "Take CPU Trace" to analyze CPU usage by function</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const vscode = acquireVsCodeApi();
+
+        // Zoom levels
+        const zoomLevels = [
+            { points: 30, label: '30 sec' },
+            { points: 60, label: '1 min' },
+            { points: 300, label: '5 min' }
+        ];
+        let currentZoom = 1;
+        let maxPoints = zoomLevels[currentZoom].points;
+
+        const allCpuHistory = [];
+        const allMemoryHistory = [];
+        const allGcHistory = [];
+        const allTimestamps = [];
+        const maxStoredPoints = 300;
+
+        const cpuCanvas = document.getElementById('cpuChart');
+        const memoryCanvas = document.getElementById('memoryChart');
+
+        // Tab switching
+        document.querySelectorAll('.tab-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                btn.classList.add('active');
+                document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+            });
+        });
+
+        // Snapshot buttons
+        document.getElementById('takeMemorySnapshot').addEventListener('click', () => {
+            vscode.postMessage({ command: 'takeMemorySnapshot' });
+        });
+
+        document.getElementById('dumpMemoryToFile').addEventListener('click', () => {
+            vscode.postMessage({ command: 'dumpMemoryToFile' });
+        });
+
+        document.getElementById('takeCpuTrace').addEventListener('click', () => {
+            const duration = parseInt(document.getElementById('traceDuration').value, 10);
+            vscode.postMessage({ command: 'takeCpuTrace', duration });
+        });
+
+        // Zoom controls
+        function updateZoomButtons() {
+            document.getElementById('zoomIn').disabled = currentZoom === 0;
+            document.getElementById('zoomOut').disabled = currentZoom === zoomLevels.length - 1;
+            document.getElementById('zoomLabel').textContent = zoomLevels[currentZoom].label;
+            maxPoints = zoomLevels[currentZoom].points;
+        }
+
+        document.getElementById('zoomIn').addEventListener('click', () => {
+            if (currentZoom > 0) { currentZoom--; updateZoomButtons(); redrawCharts(); }
+        });
+
+        document.getElementById('zoomOut').addEventListener('click', () => {
+            if (currentZoom < zoomLevels.length - 1) { currentZoom++; updateZoomButtons(); redrawCharts(); }
+        });
+
+        function formatTime(date) {
+            return date.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        }
+
+        function formatBytes(bytes) {
+            if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+            if (bytes >= 1024) return (bytes / 1024).toFixed(2) + ' KB';
+            return bytes + ' B';
+        }
+
+        function getVisibleData() {
+            const start = Math.max(0, allCpuHistory.length - maxPoints);
+            return {
+                cpu: allCpuHistory.slice(start),
+                memory: allMemoryHistory.slice(start),
+                gc: allGcHistory.slice(start),
+                timestamps: allTimestamps.slice(start)
+            };
+        }
+
+        function drawChart(canvas, datasets, yLabel, yMax, timestamps) {
+            const ctx = canvas.getContext('2d');
+            const rect = canvas.parentElement.getBoundingClientRect();
+            const dpr = window.devicePixelRatio || 1;
+
+            canvas.width = rect.width * dpr;
+            canvas.height = rect.height * dpr;
+            canvas.style.width = rect.width + 'px';
+            canvas.style.height = rect.height + 'px';
+            ctx.scale(dpr, dpr);
+
+            const width = rect.width;
+            const height = rect.height;
+            const padding = { top: 10, right: 15, bottom: 25, left: 45 };
+            const chartW = width - padding.left - padding.right;
+            const chartH = height - padding.top - padding.bottom;
+
+            ctx.clearRect(0, 0, width, height);
+
+            ctx.strokeStyle = '#3c3c3c';
+            ctx.lineWidth = 1;
+            ctx.fillStyle = '#888';
+            ctx.font = '10px sans-serif';
+
+            const ySteps = 4;
+            for (let i = 0; i <= ySteps; i++) {
+                const y = padding.top + (chartH / ySteps) * i;
+                ctx.beginPath();
+                ctx.moveTo(padding.left, y);
+                ctx.lineTo(width - padding.right, y);
+                ctx.stroke();
+
+                const val = yMax - (yMax / ySteps) * i;
+                ctx.textAlign = 'right';
+                ctx.fillText(val.toFixed(0) + yLabel, padding.left - 5, y + 3);
+            }
+
+            if (timestamps.length > 0) {
+                ctx.textAlign = 'center';
+                const xStep = chartW / (maxPoints - 1);
+                const numLabels = Math.min(5, timestamps.length);
+                const showEvery = Math.max(1, Math.floor(timestamps.length / numLabels));
+
+                for (let i = 0; i < timestamps.length; i += showEvery) {
+                    const x = padding.left + i * xStep;
+                    ctx.fillText(timestamps[i], x, height - 5);
+                }
+            }
+
+            datasets.forEach(ds => {
+                if (ds.data.length < 2) return;
+
+                ctx.strokeStyle = ds.color;
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+
+                const xStep = chartW / (maxPoints - 1);
+                ds.data.forEach((val, i) => {
+                    const x = padding.left + i * xStep;
+                    const y = padding.top + chartH - (val / yMax) * chartH;
+                    if (i === 0) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                });
+                ctx.stroke();
+            });
+        }
+
+        function redrawCharts() {
+            const visible = getVisibleData();
+            if (visible.cpu.length === 0) return;
+
+            const cpuMax = Math.max(10, Math.ceil(Math.max(...visible.cpu) * 1.2 / 10) * 10);
+            const memMax = Math.max(100, Math.ceil(Math.max(...visible.memory, ...visible.gc) * 1.2 / 50) * 50);
+
+            drawChart(cpuCanvas, [{ data: visible.cpu, color: '#4fc3f7' }], '%', cpuMax, visible.timestamps);
+            drawChart(memoryCanvas, [
+                { data: visible.memory, color: '#81c784' },
+                { data: visible.gc, color: '#ffb74d' }
+            ], '', memMax, visible.timestamps);
+        }
+
+        function update(data) {
+            document.getElementById('cpuValue').textContent = data.cpu.toFixed(1) + '%';
+            document.getElementById('memoryValue').textContent = data.memory.toFixed(1) + ' MB';
+            document.getElementById('gcHeapValue').textContent = data.gcHeap.toFixed(1) + ' MB';
+
+            allCpuHistory.push(data.cpu);
+            allMemoryHistory.push(data.memory);
+            allGcHistory.push(data.gcHeap);
+            allTimestamps.push(formatTime(new Date(data.timestamp)));
+
+            while (allCpuHistory.length > maxStoredPoints) {
+                allCpuHistory.shift();
+                allMemoryHistory.shift();
+                allGcHistory.shift();
+                allTimestamps.shift();
+            }
+
+            redrawCharts();
+        }
+
+        // Memory sort/filter state
+        let memorySortCol = 'bytes';
+        let memorySortAsc = false;
+        let memoryDataRaw = [];
+        let memoryDataPrev = null;
+        let memoryFilter = '';
+
+        document.getElementById('memoryFilter').addEventListener('input', (e) => {
+            memoryFilter = e.target.value.toLowerCase();
+            renderMemoryGrid();
+        });
+
+        function computeMemoryDeltas(current, previous) {
+            if (!previous) return current;
+
+            const prevMap = new Map();
+            for (const row of previous) {
+                prevMap.set(row.type, row);
+            }
+
+            return current.map(row => {
+                const prev = prevMap.get(row.type);
+                return {
+                    ...row,
+                    countDelta: prev ? row.count - prev.count : row.count,
+                    bytesDelta: prev ? row.bytes - prev.bytes : row.bytes
+                };
+            });
+        }
+
+        function formatDelta(value, isBytes) {
+            if (value === 0) return '<span style="color:#888">0</span>';
+            const sign = value > 0 ? '+' : '';
+            const color = value > 0 ? '#f44336' : '#4caf50';
+            const formatted = isBytes ? formatBytes(Math.abs(value)) : Math.abs(value).toLocaleString();
+            return '<span style="color:' + color + '">' + sign + (isBytes && value < 0 ? '-' : '') + (isBytes ? '' : value.toLocaleString()) + (isBytes ? (value > 0 ? '+' : '-') + formatted : '') + '</span>';
+        }
+
+        function formatDeltaNum(value) {
+            if (value === 0) return '<span style="color:#888">0</span>';
+            const sign = value > 0 ? '+' : '';
+            const color = value > 0 ? '#f44336' : '#4caf50';
+            return '<span style="color:' + color + '">' + sign + value.toLocaleString() + '</span>';
+        }
+
+        function formatDeltaBytes(value) {
+            if (value === 0) return '<span style="color:#888">0</span>';
+            const color = value > 0 ? '#f44336' : '#4caf50';
+            const sign = value > 0 ? '+' : '-';
+            return '<span style="color:' + color + '">' + sign + formatBytes(Math.abs(value)) + '</span>';
+        }
+
+        function renderMemoryGrid(data) {
+            if (data !== undefined) {
+                memoryDataPrev = memoryDataRaw.length > 0 ? memoryDataRaw : null;
+                memoryDataRaw = data;
+            }
+
+            const withDeltas = computeMemoryDeltas(memoryDataRaw, memoryDataPrev);
+            const filtered = withDeltas.filter(row =>
+                row.type.toLowerCase().includes(memoryFilter)
+            );
+            sortMemoryData(filtered);
+
+            const container = document.getElementById('memoryGridContainer');
+            if (memoryDataRaw.length === 0) {
+                container.innerHTML = '<div class="empty-state">No data available</div>';
+                return;
+            }
+            if (filtered.length === 0) {
+                container.innerHTML = '<div class="empty-state">No matching types</div>';
+                return;
+            }
+
+            const hasDeltas = memoryDataPrev !== null;
+            let html = '<div class="grid-container"><table class="data-grid"><thead><tr>';
+            html += '<th data-col="type" class="type-col">Type (' + filtered.length + ')</th>';
+            html += '<th data-col="count" class="num">Count</th>';
+            if (hasDeltas) html += '<th data-col="countDelta" class="num">Count \u0394</th>';
+            html += '<th data-col="bytes" class="num">Memory</th>';
+            if (hasDeltas) html += '<th data-col="bytesDelta" class="num">Memory \u0394</th>';
+            html += '</tr></thead><tbody>';
+
+            for (const row of filtered) {
+                html += '<tr>';
+                html += '<td class="type-col">' + escapeHtml(row.type) + '</td>';
+                html += '<td class="num">' + row.count.toLocaleString() + '</td>';
+                if (hasDeltas) html += '<td class="num">' + formatDeltaNum(row.countDelta) + '</td>';
+                html += '<td class="num">' + formatBytes(row.bytes) + '</td>';
+                if (hasDeltas) html += '<td class="num">' + formatDeltaBytes(row.bytesDelta) + '</td>';
+                html += '</tr>';
+            }
+
+            html += '</tbody></table></div>';
+            container.innerHTML = html;
+
+            container.querySelectorAll('th').forEach(th => {
+                th.addEventListener('click', () => {
+                    const col = th.dataset.col;
+                    if (memorySortCol === col) memorySortAsc = !memorySortAsc;
+                    else { memorySortCol = col; memorySortAsc = col === 'type'; }
+                    renderMemoryGrid();
+                });
+            });
+        }
+
+        function sortMemoryData(data) {
+            data.sort((a, b) => {
+                let cmp = 0;
+                if (memorySortCol === 'type') cmp = a.type.localeCompare(b.type);
+                else if (memorySortCol === 'count') cmp = a.count - b.count;
+                else if (memorySortCol === 'countDelta') cmp = (a.countDelta || 0) - (b.countDelta || 0);
+                else if (memorySortCol === 'bytesDelta') cmp = (a.bytesDelta || 0) - (b.bytesDelta || 0);
+                else cmp = a.bytes - b.bytes;
+                return memorySortAsc ? cmp : -cmp;
+            });
+        }
+
+        // CPU sort/filter state
+        let cpuSortCol = 'inclusivePercent';
+        let cpuSortAsc = false;
+        let cpuDataRaw = [];
+        let cpuFilter = '';
+
+        document.getElementById('cpuFilter').addEventListener('input', (e) => {
+            cpuFilter = e.target.value.toLowerCase();
+            renderCpuGrid();
+        });
+
+        function renderCpuGrid(data) {
+            if (data !== undefined) cpuDataRaw = data;
+
+            const filtered = cpuDataRaw.filter(row =>
+                row.function.toLowerCase().includes(cpuFilter)
+            );
+            sortCpuData(filtered);
+
+            const container = document.getElementById('cpuGridContainer');
+            if (cpuDataRaw.length === 0) {
+                container.innerHTML = '<div class="empty-state">No data available</div>';
+                return;
+            }
+            if (filtered.length === 0) {
+                container.innerHTML = '<div class="empty-state">No matching functions</div>';
+                return;
+            }
+
+            let html = '<div class="grid-container"><table class="data-grid"><thead><tr>';
+            html += '<th data-col="function" class="func-col">Function (' + filtered.length + ')</th>';
+            html += '<th data-col="inclusivePercent" class="num">Inclusive %</th>';
+            html += '<th data-col="exclusivePercent" class="num">Exclusive %</th>';
+            html += '</tr></thead><tbody>';
+
+            for (const row of filtered) {
+                html += '<tr>';
+                html += '<td class="func-col">' + escapeHtml(row.function) + '</td>';
+                html += '<td class="num">' + row.inclusivePercent.toFixed(2) + '%</td>';
+                html += '<td class="num">' + row.exclusivePercent.toFixed(2) + '%</td>';
+                html += '</tr>';
+            }
+
+            html += '</tbody></table></div>';
+            container.innerHTML = html;
+
+            container.querySelectorAll('th').forEach(th => {
+                th.addEventListener('click', () => {
+                    const col = th.dataset.col;
+                    if (cpuSortCol === col) cpuSortAsc = !cpuSortAsc;
+                    else { cpuSortCol = col; cpuSortAsc = col === 'function'; }
+                    renderCpuGrid();
+                });
+            });
+        }
+
+        function sortCpuData(data) {
+            data.sort((a, b) => {
+                let cmp = 0;
+                if (cpuSortCol === 'function') cmp = a.function.localeCompare(b.function);
+                else if (cpuSortCol === 'exclusivePercent') cmp = a.exclusivePercent - b.exclusivePercent;
+                else cmp = a.inclusivePercent - b.inclusivePercent;
+                return cpuSortAsc ? cmp : -cmp;
+            });
+        }
+
+        function escapeHtml(str) {
+            return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        }
+
+        function truncate(str, len) {
+            return str.length > len ? str.substring(0, len) + '...' : str;
+        }
+
+        window.addEventListener('message', e => {
+            const msg = e.data;
+            switch (msg.type) {
+                case 'update':
+                    update(msg.data);
+                    break;
+                case 'snapshotStarted':
+                    const loadingHtml = '<div class="loading">Collecting data...</div>';
+                    if (msg.tab === 'memory') {
+                        document.getElementById('memoryGridContainer').innerHTML = loadingHtml;
+                        document.getElementById('takeMemorySnapshot').disabled = true;
+                    } else {
+                        document.getElementById('cpuGridContainer').innerHTML = loadingHtml;
+                        document.getElementById('takeCpuTrace').disabled = true;
+                    }
+                    break;
+                case 'memorySnapshot':
+                    document.getElementById('takeMemorySnapshot').disabled = false;
+                    renderMemoryGrid(msg.data);
+                    break;
+                case 'cpuTrace':
+                    document.getElementById('takeCpuTrace').disabled = false;
+                    renderCpuGrid(msg.data);
+                    break;
+                case 'snapshotError':
+                    if (msg.tab === 'memory') {
+                        document.getElementById('takeMemorySnapshot').disabled = false;
+                        document.getElementById('memoryGridContainer').innerHTML = '<div class="empty-state">Error: ' + msg.error + '</div>';
+                    } else {
+                        document.getElementById('takeCpuTrace').disabled = false;
+                        document.getElementById('cpuGridContainer').innerHTML = '<div class="empty-state">Error: ' + msg.error + '</div>';
+                    }
+                    break;
+                case 'dumpStarted':
+                    document.getElementById('dumpMemoryToFile').disabled = true;
+                    document.getElementById('dumpMemoryToFile').textContent = 'Dumping...';
+                    break;
+                case 'dumpComplete':
+                    document.getElementById('dumpMemoryToFile').disabled = false;
+                    document.getElementById('dumpMemoryToFile').textContent = 'Dump Memory To File';
+                    break;
+                case 'dumpError':
+                    document.getElementById('dumpMemoryToFile').disabled = false;
+                    document.getElementById('dumpMemoryToFile').textContent = 'Dump Memory To File';
+                    break;
+            }
+        });
+
+        window.addEventListener('resize', redrawCharts);
+        updateZoomButtons();
+    </script>
+</body>
+</html>`;
+}
+
+async function startMonitoring(): Promise<void> {
+    if (monitoringProcess) {
+        vscode.window.showWarningMessage('Monitoring is already running. Stop it first before starting a new session.');
+        return;
+    }
+
+    if (!await ensureTool('dotnet-counters')) {
+        return;
+    }
+
+    const processId = await getDebuggedProcessId();
+    if (!processId) {
+        return;
+    }
+
+    currentProcessId = processId;
+
+    if (panel) {
+        panel.reveal(vscode.ViewColumn.Beside);
+    } else {
+        panel = createWebviewPanel(processId);
+    }
+
+    outputFile = path.join(os.tmpdir(), `dotnet-counters-${processId}-${Date.now()}.json`);
+    lastFileSize = 0;
+    lastEventCount = 0;
+
+    monitoringProcess = spawn('dotnet-counters', [
+        'collect',
+        '--process-id', processId.toString(),
+        '--refresh-interval', '1',
+        '--format', 'json',
+        '--output', outputFile
+    ], { shell: true });
+
+    monitoringProcess.on('error', (error) => {
+        vscode.window.showErrorMessage(`Failed to start dotnet-counters: ${error.message}`);
+        cleanup();
+    });
+
+    monitoringProcess.on('close', (code) => {
+        if (code !== 0 && code !== null) {
+            vscode.window.showWarningMessage(`dotnet-counters exited with code ${code}`);
+        }
+        cleanup();
+    });
+
+    startFilePolling();
+    vscode.window.showInformationMessage(`Monitoring .NET process ${processId}`);
+}
+
+function startFilePolling(): void {
+    readInterval = setInterval(() => {
+        if (!outputFile || !fs.existsSync(outputFile)) {
+            return;
+        }
+
+        try {
+            const content = fs.readFileSync(outputFile, 'utf8');
+            if (content.length > lastFileSize) {
+                lastFileSize = content.length;
+                parseAndUpdateChart(content);
+            }
+        } catch {
+            // File might be locked
+        }
+    }, 1000);
+}
+
+function parseAndUpdateChart(content: string): void {
+    try {
+        let json = content;
+        if (!json.trim().endsWith(']}')) {
+            json = json.replace(/,\s*$/, '') + ']}';
+        }
+
+        const data = JSON.parse(json) as CounterData;
+
+        if (data.Events && data.Events.length > lastEventCount) {
+            const newEvents = data.Events.slice(lastEventCount);
+            lastEventCount = data.Events.length;
+
+            const grouped = new Map<string, CounterEvent[]>();
+            for (const event of newEvents) {
+                const timestamp = event.timestamp ? event.timestamp.substring(0, 19) : 'unknown';
+                if (!grouped.has(timestamp)) {
+                    grouped.set(timestamp, []);
+                }
+                grouped.get(timestamp)!.push(event);
+            }
+
+            for (const [timestamp, events] of grouped) {
+                const metrics = extractMetrics(events, timestamp);
+                if (metrics.cpu > 0 || metrics.memory > 0 || metrics.gcHeap > 0) {
+                    if (panel) {
+                        panel.webview.postMessage({
+                            type: 'update',
+                            data: metrics
+                        });
+                    }
+                }
+            }
+        }
+    } catch {
+        // JSON parsing failed
+    }
+}
+
+function extractMetrics(events: CounterEvent[], timestamp: string): { cpu: number; memory: number; gcHeap: number; timestamp: string } {
+    let cpu = 0;
+    let memory = 0;
+    let gcHeap = 0;
+
+    for (const event of events) {
+        const name = event.name;
+
+        if (name === 'CPU Usage (%)') {
+            cpu = event.value;
+        } else if (name === 'Working Set (MB)') {
+            memory = event.value;
+        } else if (name === 'GC Heap Size (MB)') {
+            gcHeap = event.value;
+        }
+    }
+
+    return { cpu, memory, gcHeap, timestamp };
+}
+
+interface CounterEvent {
+    timestamp: string;
+    provider: string;
+    name: string;
+    tags: string;
+    counterType: string;
+    value: number;
+}
+
+interface CounterData {
+    TargetProcess: string;
+    StartTime: string;
+    Events: CounterEvent[];
+}
+
+function cleanup(): void {
+    if (readInterval) {
+        clearInterval(readInterval);
+        readInterval = null;
+    }
+    if (outputFile && fs.existsSync(outputFile)) {
+        try {
+            fs.unlinkSync(outputFile);
+        } catch {
+            // Ignore
+        }
+        outputFile = null;
+    }
+    monitoringProcess = null;
+    lastFileSize = 0;
+    lastEventCount = 0;
+}
+
+function stopMonitoring(): void {
+    if (monitoringProcess) {
+        const pid = monitoringProcess.pid;
+        if (pid) {
+            try {
+                process.kill(-pid, 'SIGTERM');
+            } catch {
+                monitoringProcess.kill('SIGTERM');
+            }
+        }
+
+        setTimeout(() => {
+            if (monitoringProcess) {
+                try {
+                    monitoringProcess.kill('SIGKILL');
+                } catch {
+                    // Already dead
+                }
+            }
+            cleanup();
+        }, 500);
+
+        vscode.window.showInformationMessage('DotNet Profiler monitoring stopped.');
+    } else {
+        vscode.window.showInformationMessage('No monitoring session is active.');
+    }
+}
+
+export function deactivate() {
+    stopMonitoring();
+    if (panel) {
+        panel.dispose();
+    }
+}
