@@ -1,7 +1,8 @@
 {
   "name": "dotnet-profiler",
+  "publisher": "ghostbust555",
   "displayName": "DotNet Profiler",
-  "description": "Monitor .NET process performance metrics using dotnet-counters",
+  "description": "A VScode equivalent of the profiling tools within Visual Studio. Dump memory and trace cpu for dotnet processes.",
   "version": "0.0.1",
   "engines": {
     "vscode": "^1.85.0"
