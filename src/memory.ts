@@ -5,6 +5,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { ensureTool } from './tools';
 import { DumpObjField, DumpObjResult, GcDumpEntry, HeapObject } from './types';
+import { setMemoryContext } from './ai';
 
 let currentHeapDump: string | null = null;
 
@@ -14,6 +15,21 @@ export function getCurrentHeapDump(): string | null {
 
 export function setCurrentHeapDump(dumpPath: string | null): void {
     currentHeapDump = dumpPath;
+}
+
+export function openDumpInTerminal(): void {
+    if (!currentHeapDump || !fs.existsSync(currentHeapDump)) {
+        vscode.window.showErrorMessage('No heap dump available. Click on a type in the memory snapshot first to create a dump.');
+        return;
+    }
+
+    const terminal = vscode.window.createTerminal({
+        name: 'dotnet-dump analyze',
+        cwd: path.dirname(currentHeapDump)
+    });
+
+    terminal.show();
+    terminal.sendText(`dotnet-dump analyze '${currentHeapDump}'`);
 }
 
 export async function takeMemorySnapshot(
@@ -45,6 +61,7 @@ export async function takeMemorySnapshot(
     proc.on('close', (code) => {
         if (code === 0) {
             const results = parseGcDumpOutput(output);
+            setMemoryContext(results);
             panel?.webview.postMessage({
                 type: 'memorySnapshot',
                 data: results
@@ -461,21 +478,127 @@ async function reformatDumpObjWithTypeResolution(lines: string[], dumpPath: stri
     const fields: DumpObjField[] = rawFields.map(f => {
         const resolvedType = mtToType.get(f.mt) || f.type;
         const isStatic = f.attr === 'static';
-        const isReference = f.vt === '0' &&
+        const isPrimitive = isPrimitiveType(resolvedType);
+        const isReference = !isPrimitive && f.vt === '0' &&
             !f.value.match(/^0+$/) &&
             f.value.match(/^[0-9a-f]+$/i) !== null;
+        const displayValue = isPrimitive ? parsePrimitiveValue(resolvedType, f.value) : undefined;
 
         return {
             name: f.name,
             type: resolvedType,
             value: f.value,
+            displayValue,
             isStatic,
             offset: f.offset,
-            isReference
+            isReference,
+            isPrimitive
         };
     });
 
     return { header, fields };
+}
+
+function isPrimitiveType(typeName: string): boolean {
+    const primitives = [
+        'System.Boolean', 'System.Byte', 'System.SByte',
+        'System.Int16', 'System.UInt16', 'System.Int32', 'System.UInt32',
+        'System.Int64', 'System.UInt64', 'System.Single', 'System.Double',
+        'System.Char', 'System.IntPtr', 'System.UIntPtr',
+        'Boolean', 'Byte', 'SByte', 'Int16', 'UInt16', 'Int32', 'UInt32',
+        'Int64', 'UInt64', 'Single', 'Double', 'Char', 'IntPtr', 'UIntPtr'
+    ];
+    return primitives.includes(typeName);
+}
+
+function parsePrimitiveValue(typeName: string, hexValue: string): string {
+    try {
+        const value = BigInt('0x' + hexValue);
+
+        switch (typeName) {
+            case 'System.Boolean':
+            case 'Boolean':
+                return value === 0n ? 'false' : 'true';
+
+            case 'System.Byte':
+            case 'Byte':
+                return (Number(value) & 0xFF).toString();
+
+            case 'System.SByte':
+            case 'SByte': {
+                const byte = Number(value) & 0xFF;
+                return (byte > 127 ? byte - 256 : byte).toString();
+            }
+
+            case 'System.Int16':
+            case 'Int16': {
+                const val = Number(value) & 0xFFFF;
+                return (val > 32767 ? val - 65536 : val).toString();
+            }
+
+            case 'System.UInt16':
+            case 'UInt16':
+                return (Number(value) & 0xFFFF).toString();
+
+            case 'System.Int32':
+            case 'Int32': {
+                const val = Number(value) & 0xFFFFFFFF;
+                return (val > 2147483647 ? val - 4294967296 : val).toString();
+            }
+
+            case 'System.UInt32':
+            case 'UInt32':
+                return (Number(value) & 0xFFFFFFFF).toString();
+
+            case 'System.Int64':
+            case 'Int64': {
+                const maxInt64 = BigInt('9223372036854775807');
+                if (value > maxInt64) {
+                    return (value - BigInt('18446744073709551616')).toString();
+                }
+                return value.toString();
+            }
+
+            case 'System.UInt64':
+            case 'UInt64':
+                return value.toString();
+
+            case 'System.Single':
+            case 'Single': {
+                const intVal = Number(value) & 0xFFFFFFFF;
+                const buffer = new ArrayBuffer(4);
+                new DataView(buffer).setUint32(0, intVal, true);
+                return new DataView(buffer).getFloat32(0, true).toString();
+            }
+
+            case 'System.Double':
+            case 'Double': {
+                const buffer = new ArrayBuffer(8);
+                new DataView(buffer).setBigUint64(0, value, true);
+                return new DataView(buffer).getFloat64(0, true).toString();
+            }
+
+            case 'System.Char':
+            case 'Char': {
+                const charCode = Number(value) & 0xFFFF;
+                if (charCode >= 32 && charCode < 127) {
+                    return `'${String.fromCharCode(charCode)}'`;
+                }
+                return `'\\u${charCode.toString(16).padStart(4, '0')}'`;
+            }
+
+            case 'System.IntPtr':
+            case 'IntPtr':
+            case 'System.UIntPtr':
+            case 'UIntPtr':
+                return '0x' + hexValue;
+
+            default:
+                return '0x' + hexValue;
+        }
+    } catch {
+        return '0x' + hexValue;
+    }
 }
 
 async function resolveMethodTableType(dumpPath: string, mtAddress: string): Promise<string | null> {

@@ -5,6 +5,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { ensureTool } from './tools';
 import { CpuTraceEntry } from './types';
+import { setCpuContext } from './ai';
 
 let currentTraceFile: string | null = null;
 
@@ -60,6 +61,7 @@ export async function takeCpuTrace(
             reportProc.on('close', (reportCode) => {
                 if (reportCode === 0) {
                     const results = parseCpuTraceOutput(reportOutput);
+                    setCpuContext(results);
                     panel?.webview.postMessage({
                         type: 'cpuTrace',
                         data: results,

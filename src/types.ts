@@ -8,9 +8,11 @@ export interface DumpObjField {
     name: string;
     type: string;
     value: string;
+    displayValue?: string;
     isStatic: boolean;
     offset: string;
     isReference: boolean;
+    isPrimitive: boolean;
 }
 
 export interface DumpObjResult {

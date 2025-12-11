@@ -1,9 +1,10 @@
 import * as vscode from 'vscode';
 import { isDotNetSession } from './processes';
-import { takeMemorySnapshot, dumpMemoryToFile, getTypeRoots, getObjectDetails } from './memory';
+import { takeMemorySnapshot, dumpMemoryToFile, getTypeRoots, getObjectDetails, openDumpInTerminal } from './memory';
 import { takeCpuTrace, openInSpeedscope } from './cpu';
 import { startMonitoring, stopMonitoring } from './monitoring';
 import { getWebviewContent } from './webview';
+import { analyzeWithAI } from './ai';
 
 let panel: vscode.WebviewPanel | null = null;
 let extensionContext: vscode.ExtensionContext;
@@ -90,6 +91,12 @@ function createWebviewPanel(processId: number): vscode.WebviewPanel {
                     break;
                 case 'openInSpeedscope':
                     await openInSpeedscope(panel);
+                    break;
+                case 'askAI':
+                    await analyzeWithAI(message.question, panel);
+                    break;
+                case 'openDumpTerminal':
+                    openDumpInTerminal();
                     break;
             }
         },

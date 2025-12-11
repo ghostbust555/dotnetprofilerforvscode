@@ -49,32 +49,33 @@ export function getWebviewContent(): string {
         .zoom-label { font-size: 0.85em; color: #888; min-width: 60px; text-align: center; }
         .stats {
             display: flex;
-            gap: 12px;
-            margin-bottom: 16px;
+            gap: 8px;
+            margin-bottom: 12px;
             flex-wrap: wrap;
         }
         .stat-card {
             background: var(--vscode-input-background, #3c3c3c);
             border: 1px solid var(--vscode-panel-border, #3c3c3c);
             border-radius: 4px;
-            padding: 12px 20px;
-            text-align: center;
-            min-width: 120px;
+            padding: 6px 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
         }
-        .stat-value { font-size: 1.6em; font-weight: bold; }
+        .stat-value { font-size: 1.1em; font-weight: bold; }
         .stat-value.cpu { color: #4fc3f7; }
         .stat-value.memory { color: #81c784; }
         .stat-value.gc { color: #ffb74d; }
-        .stat-label { font-size: 0.8em; color: #888; margin-top: 4px; }
+        .stat-label { font-size: 0.75em; color: #888; }
         .chart-container {
             background: var(--vscode-input-background, #252526);
             border: 1px solid var(--vscode-panel-border, #3c3c3c);
             border-radius: 4px;
-            padding: 12px;
-            margin-bottom: 16px;
+            padding: 8px;
+            margin-bottom: 8px;
         }
-        .chart-title { font-size: 0.95em; margin-bottom: 8px; }
-        .chart { height: 150px; position: relative; }
+        .chart-title { font-size: 0.85em; margin-bottom: 4px; }
+        .chart { height: 80px; position: relative; }
         canvas { display: block; }
 
         /* Tabs */
@@ -371,6 +372,15 @@ export function getWebviewContent(): string {
         .field-value {
             color: #888;
         }
+        .field-primitive {
+            color: #b5cea8;
+            font-weight: 500;
+        }
+        .field-primitive-hex {
+            color: #666;
+            font-size: 10px;
+            margin-left: 4px;
+        }
         .field-offset {
             color: #666;
             font-size: 10px;
@@ -450,6 +460,116 @@ export function getWebviewContent(): string {
             flex-direction: column;
             min-height: 0;
         }
+
+        /* AI Panel */
+        .ai-panel {
+            margin-top: 16px;
+            border: 1px solid var(--vscode-panel-border, #3c3c3c);
+            border-radius: 4px;
+            background: var(--vscode-editor-background, #1e1e1e);
+        }
+        .ai-panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 12px;
+            background: var(--vscode-input-background, #3c3c3c);
+            cursor: pointer;
+            user-select: none;
+        }
+        .ai-panel-header:hover {
+            background: var(--vscode-list-hoverBackground, #2a2d2e);
+        }
+        .ai-panel-header h3 {
+            font-size: 13px;
+            font-weight: 600;
+            margin: 0;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .ai-panel-toggle {
+            font-size: 10px;
+            color: #888;
+            transition: transform 0.2s;
+        }
+        .ai-panel.expanded .ai-panel-toggle {
+            transform: rotate(90deg);
+        }
+        .ai-panel-content {
+            display: none;
+            padding: 12px;
+            border-top: 1px solid var(--vscode-panel-border, #3c3c3c);
+        }
+        .ai-panel.expanded .ai-panel-content {
+            display: block;
+        }
+        .ai-input-row {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 12px;
+        }
+        .ai-input-row input {
+            flex: 1;
+            padding: 8px 12px;
+            background: #1a1a1a;
+            color: var(--vscode-input-foreground, #d4d4d4);
+            border: 1px solid var(--vscode-panel-border, #3c3c3c);
+            border-radius: 4px;
+            font-size: 13px;
+        }
+        .ai-input-row input::placeholder {
+            color: var(--vscode-input-placeholderForeground, #888);
+        }
+        .ai-response {
+            background: var(--vscode-input-background, #252526);
+            border: 1px solid var(--vscode-panel-border, #3c3c3c);
+            border-radius: 4px;
+            padding: 12px;
+            min-height: 100px;
+            max-height: 300px;
+            overflow-y: auto;
+            font-size: 13px;
+            line-height: 1.5;
+            white-space: pre-wrap;
+        }
+        .ai-response.empty {
+            color: #888;
+            font-style: italic;
+        }
+        .ai-response.loading::after {
+            content: '';
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border: 2px solid #888;
+            border-top-color: transparent;
+            border-radius: 50%;
+            margin-left: 8px;
+            animation: spin 1s linear infinite;
+            vertical-align: middle;
+        }
+        .ai-response.error {
+            color: var(--vscode-errorForeground, #f44336);
+        }
+        .ai-suggestions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-bottom: 12px;
+        }
+        .ai-suggestion {
+            padding: 4px 10px;
+            background: var(--vscode-input-background, #3c3c3c);
+            border: 1px solid var(--vscode-panel-border, #3c3c3c);
+            border-radius: 12px;
+            font-size: 11px;
+            cursor: pointer;
+            color: var(--vscode-textLink-foreground, #3794ff);
+        }
+        .ai-suggestion:hover {
+            background: var(--vscode-list-hoverBackground, #2a2d2e);
+        }
     </style>
 </head>
 <body>
@@ -464,16 +584,16 @@ export function getWebviewContent(): string {
 
     <div class="stats">
         <div class="stat-card">
+            <div class="stat-label">CPU</div>
             <div class="stat-value cpu" id="cpuValue">0%</div>
-            <div class="stat-label">CPU Usage</div>
         </div>
         <div class="stat-card">
+            <div class="stat-label">Memory</div>
             <div class="stat-value memory" id="memoryValue">0 MB</div>
-            <div class="stat-label">Working Set</div>
         </div>
         <div class="stat-card">
-            <div class="stat-value gc" id="gcHeapValue">0 MB</div>
             <div class="stat-label">GC Heap</div>
+            <div class="stat-value gc" id="gcHeapValue">0 MB</div>
         </div>
     </div>
 
@@ -497,6 +617,7 @@ export function getWebviewContent(): string {
             <div class="snapshot-controls">
                 <button class="btn btn-primary" id="takeMemorySnapshot">Take Memory Snapshot</button>
                 <button class="btn btn-secondary" id="dumpMemoryToFile">Dump Memory To File</button>
+                <button class="btn btn-secondary" id="openDumpTerminal" disabled title="Open dump file in terminal for manual analysis">Open in Terminal</button>
                 <input type="text" id="memoryFilter" placeholder="Filter types..." />
             </div>
             <div id="memoryGridContainer">
@@ -529,6 +650,25 @@ export function getWebviewContent(): string {
             <div id="cpuGridContainer">
                 <div class="empty-state">Click "Take CPU Trace" to analyze CPU usage by function</div>
             </div>
+        </div>
+    </div>
+
+    <div class="ai-panel" id="aiPanel">
+        <div class="ai-panel-header" id="aiPanelHeader">
+            <h3><span class="ai-panel-toggle">&#9654;</span> AI Analysis (Copilot)</h3>
+        </div>
+        <div class="ai-panel-content">
+            <div class="ai-suggestions">
+                <button class="ai-suggestion" data-prompt="What are the largest memory consumers and how can I reduce memory usage?">Memory analysis</button>
+                <button class="ai-suggestion" data-prompt="What functions are taking the most CPU time and how can I optimize them?">CPU hotspots</button>
+                <button class="ai-suggestion" data-prompt="Are there any potential memory leaks based on the type distribution?">Memory leaks</button>
+                <button class="ai-suggestion" data-prompt="Summarize the performance characteristics of this application">Summary</button>
+            </div>
+            <div class="ai-input-row">
+                <input type="text" id="aiInput" placeholder="Ask about your profiling data..." />
+                <button class="btn btn-primary" id="aiAskBtn">Ask AI</button>
+            </div>
+            <div class="ai-response empty" id="aiResponse">Take a memory snapshot or CPU trace, then ask AI to analyze the results.</div>
         </div>
     </div>
 
@@ -576,6 +716,10 @@ export function getWebviewContent(): string {
             document.getElementById('objectsPanel').style.display = 'none';
         });
 
+        document.getElementById('openDumpTerminal').addEventListener('click', () => {
+            vscode.postMessage({ command: 'openDumpTerminal' });
+        });
+
         function showRootsForType(typeName) {
             vscode.postMessage({ command: 'getTypeRoots', typeName });
         }
@@ -598,6 +742,35 @@ export function getWebviewContent(): string {
                     setTimeout(() => { btn.innerHTML = '&#128279;'; }, 1500);
                 });
             }
+        });
+
+        // AI Panel
+        document.getElementById('aiPanelHeader').addEventListener('click', () => {
+            document.getElementById('aiPanel').classList.toggle('expanded');
+        });
+
+        document.getElementById('aiAskBtn').addEventListener('click', () => {
+            const input = document.getElementById('aiInput');
+            const question = input.value.trim();
+            if (question) {
+                vscode.postMessage({ command: 'askAI', question });
+                input.value = '';
+            }
+        });
+
+        document.getElementById('aiInput').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                document.getElementById('aiAskBtn').click();
+            }
+        });
+
+        document.querySelectorAll('.ai-suggestion').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const prompt = btn.dataset.prompt;
+                if (prompt) {
+                    vscode.postMessage({ command: 'askAI', question: prompt });
+                }
+            });
         });
 
         // Zoom controls
@@ -992,6 +1165,9 @@ export function getWebviewContent(): string {
                     break;
                 case 'rootsResult':
                     renderObjectsResult(msg);
+                    if (msg.dumpPath) {
+                        document.getElementById('openDumpTerminal').disabled = false;
+                    }
                     break;
                 case 'rootsError':
                     showObjectsPanel('Error', '<div class="objects-empty">Error: ' + escapeHtml(msg.error) + '</div>');
@@ -1004,6 +1180,39 @@ export function getWebviewContent(): string {
                 case 'speedscopeUrl':
                     currentSpeedscopeUrl = msg.url;
                     document.getElementById('copySpeedscopeUrl').style.display = 'inline-block';
+                    break;
+                case 'aiResponseStart':
+                    const aiResponseEl = document.getElementById('aiResponse');
+                    aiResponseEl.textContent = 'Thinking...';
+                    aiResponseEl.className = 'ai-response loading';
+                    document.getElementById('aiAskBtn').disabled = true;
+                    // Auto-expand AI panel
+                    document.getElementById('aiPanel').classList.add('expanded');
+                    break;
+                case 'aiResponseChunk':
+                    const responseEl = document.getElementById('aiResponse');
+                    if (responseEl.classList.contains('loading')) {
+                        responseEl.textContent = '';
+                        responseEl.className = 'ai-response';
+                    }
+                    responseEl.textContent += msg.chunk;
+                    responseEl.scrollTop = responseEl.scrollHeight;
+                    break;
+                case 'aiResponseEnd':
+                    document.getElementById('aiAskBtn').disabled = false;
+                    break;
+                case 'aiResponse':
+                    const aiRespEl = document.getElementById('aiResponse');
+                    document.getElementById('aiAskBtn').disabled = false;
+                    if (msg.error) {
+                        aiRespEl.textContent = msg.error;
+                        aiRespEl.className = 'ai-response error';
+                    } else {
+                        aiRespEl.textContent = msg.response;
+                        aiRespEl.className = 'ai-response';
+                    }
+                    // Auto-expand AI panel
+                    document.getElementById('aiPanel').classList.add('expanded');
                     break;
             }
         });
@@ -1148,6 +1357,16 @@ export function getWebviewContent(): string {
                         html += '<span class="field-ref" data-address="' + field.value + '" data-dumppath="' + escapeHtml(dumpPath) + '">';
                         html += '(0x' + field.value + ')';
                         html += '</span> ';
+                        html += '<span class="field-offset">' + offsetInfo + '</span>';
+                        html += '</div>';
+                    } else if (field.isPrimitive && field.displayValue) {
+                        // Primitive type with readable value
+                        html += '<div class="field-line">';
+                        html += '<span class="field-static">' + staticPrefix + '</span>';
+                        html += '<span class="field-type">' + escapeHtml(field.type) + '</span> ';
+                        html += '<span class="field-name">' + escapeHtml(field.name) + '</span> = ';
+                        html += '<span class="field-primitive">' + escapeHtml(field.displayValue) + '</span>';
+                        html += '<span class="field-primitive-hex">(0x' + field.value + ')</span> ';
                         html += '<span class="field-offset">' + offsetInfo + '</span>';
                         html += '</div>';
                     } else {
