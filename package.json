@@ -3,11 +3,12 @@
   "publisher": "ghostbust555",
   "displayName": "DotNet Profiler",
   "description": "A VScode equivalent of the profiling tools within Visual Studio. Dump memory and trace cpu for dotnet processes.",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "repository": {
     "type": "git",
     "url": "https://github.com/ghostbust555/dotnetprofilerforvscode.git"
   },
+  "icon": "icon.png",
   "engines": {
     "vscode": "^1.90.0"
   },

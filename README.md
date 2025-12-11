@@ -4,7 +4,7 @@ A VS Code extension that brings Visual Studio-style profiling tools to VS Code. 
 
 ## Features
 
-![alt text](image.png)
+![DotNet Profiler Screenshot](https://github.com/ghostbust555/dotnetprofilerforvscode/blob/master/image.png?raw=true)
 
 ### Real-time Performance Monitoring
 - **CPU Usage** - Live CPU utilization chart with configurable time windows (30s, 1min, 5min)

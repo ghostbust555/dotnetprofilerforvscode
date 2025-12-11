@@ -45,26 +45,51 @@ export async function takeMemorySnapshot(
         return;
     }
 
+    if (!await ensureTool('dotnet-dump')) {
+        return;
+    }
+
     panel?.webview.postMessage({ type: 'snapshotStarted', tab: 'memory' });
 
-    const proc = spawn('dotnet-gcdump', ['report', '-p', currentProcessId.toString()], { shell: true });
-    let output = '';
+    // Create a heap dump file for terminal access
+    const dumpPath = path.join(os.tmpdir(), `dotnet-heap-${currentProcessId}-${Date.now()}.dump`);
 
-    proc.stdout.on('data', (data) => {
-        output += data.toString();
+    // Run gcdump report and dump collect in parallel
+    const gcdumpProc = spawn('dotnet-gcdump', ['report', '-p', currentProcessId.toString()], { shell: true });
+    const dumpProc = spawn('dotnet-dump', ['collect', '-p', currentProcessId.toString(), '--type', 'Heap', '-o', dumpPath], { shell: true });
+
+    let gcdumpOutput = '';
+
+    gcdumpProc.stdout.on('data', (data) => {
+        gcdumpOutput += data.toString();
     });
 
-    proc.stderr?.on('data', (data) => {
+    gcdumpProc.stderr?.on('data', (data) => {
         console.error('gcdump stderr:', data.toString());
     });
 
-    proc.on('close', (code) => {
-        if (code === 0) {
-            const results = parseGcDumpOutput(output);
+    // Track completion of both processes
+    let gcdumpDone = false;
+    let dumpDone = false;
+    let gcdumpSuccess = false;
+    let dumpSuccess = false;
+
+    const checkComplete = () => {
+        if (!gcdumpDone || !dumpDone) return;
+
+        if (gcdumpSuccess) {
+            const results = parseGcDumpOutput(gcdumpOutput);
             setMemoryContext(results);
+
+            // Set the dump path if dump succeeded
+            if (dumpSuccess && fs.existsSync(dumpPath)) {
+                currentHeapDump = dumpPath;
+            }
+
             panel?.webview.postMessage({
                 type: 'memorySnapshot',
-                data: results
+                data: results,
+                hasDump: dumpSuccess
             });
         } else {
             panel?.webview.postMessage({
@@ -73,14 +98,32 @@ export async function takeMemorySnapshot(
                 error: 'Failed to capture memory snapshot'
             });
         }
+    };
+
+    gcdumpProc.on('close', (code) => {
+        gcdumpDone = true;
+        gcdumpSuccess = code === 0;
+        checkComplete();
     });
 
-    proc.on('error', (err) => {
-        panel?.webview.postMessage({
-            type: 'snapshotError',
-            tab: 'memory',
-            error: err.message
-        });
+    gcdumpProc.on('error', (err) => {
+        gcdumpDone = true;
+        gcdumpSuccess = false;
+        console.error('gcdump error:', err.message);
+        checkComplete();
+    });
+
+    dumpProc.on('close', (code) => {
+        dumpDone = true;
+        dumpSuccess = code === 0;
+        checkComplete();
+    });
+
+    dumpProc.on('error', (err) => {
+        dumpDone = true;
+        dumpSuccess = false;
+        console.error('dump collect error:', err.message);
+        checkComplete();
     });
 }
 
@@ -181,7 +224,9 @@ export async function getTypeRoots(
         }
     }
 
-    const shellEscapedTypeName = typeName.replace(/'/g, "'\\''");
+    // Strip any remaining size bucket annotations and escape for shell
+    const cleanTypeName = typeName.replace(/\s*\([^)]*Bytes[^)]*\)\s*$/i, '').trim();
+    const shellEscapedTypeName = cleanTypeName.replace(/'/g, "'\\''");
     const dumpheapCmd = `dotnet-dump analyze '${currentHeapDump}' -c 'dumpheap -type ${shellEscapedTypeName}' -c exit`;
     const dumpheapProc = spawn(dumpheapCmd, [], { shell: true });
 
@@ -654,7 +699,7 @@ export function parseHeapAddresses(output: string): HeapObject[] {
 }
 
 export function parseGcDumpOutput(output: string): GcDumpEntry[] {
-    const results: GcDumpEntry[] = [];
+    const typeMap = new Map<string, { count: number; bytes: number }>();
     const lines = output.split('\n');
 
     let dataStarted = false;
@@ -673,15 +718,31 @@ export function parseGcDumpOutput(output: string): GcDumpEntry[] {
             const count = parseInt(match[2].replace(/,/g, ''), 10);
             let type = match[3].trim();
 
-            type = type.replace(/\s*\(Bytes\s*[><=]+\s*[\dKMGB,]+\)\s*$/i, '').trim();
+            // Remove size bucket annotations like "(Bytes > 100K)", "(Bytes >= 1,024)", "(Bytes > 1K)", etc.
+            // This pattern is more aggressive to catch all variations
+            type = type.replace(/\s*\([^)]*Bytes[^)]*\)\s*$/i, '').trim();
 
+            // Remove assembly annotations like "[System.Private.CoreLib]"
             const assemblyMatch = type.match(/^(.+?)\s*\[[A-Za-z][\w.]*\]$/);
             if (assemblyMatch) {
                 type = assemblyMatch[1].trim();
             }
 
-            results.push({ type, count, bytes });
+            // Aggregate entries with the same type name (combines size bucket entries)
+            const existing = typeMap.get(type);
+            if (existing) {
+                existing.count += count;
+                existing.bytes += bytes;
+            } else {
+                typeMap.set(type, { count, bytes });
+            }
         }
+    }
+
+    // Convert map to array
+    const results: GcDumpEntry[] = [];
+    for (const [type, data] of typeMap) {
+        results.push({ type, count: data.count, bytes: data.bytes });
     }
 
     return results;

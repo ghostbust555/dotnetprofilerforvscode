@@ -1130,6 +1130,9 @@ export function getWebviewContent(): string {
                     break;
                 case 'memorySnapshot':
                     document.getElementById('takeMemorySnapshot').disabled = false;
+                    if (msg.hasDump) {
+                        document.getElementById('openDumpTerminal').disabled = false;
+                    }
                     renderMemoryGrid(msg.data);
                     break;
                 case 'cpuTrace':
